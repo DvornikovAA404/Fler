@@ -7,6 +7,9 @@ from difflib import get_close_matches
 from typing import List
 from discord import app_commands
 from discord.utils import get
+import re
+from typing import Optional
+
 
 # ══════════ НАСТРОЙКИ ══════════
 BOT_PREFIX = "!!!!"
@@ -28,22 +31,32 @@ def has_allowed_role(user: discord.Member) -> bool:
 # УНИВЕРСАЛЬНОЕ ЛОГИРОВАНИЕ
 # level: "success" | "warn" | "error"
 # ------------------------------------------------------------------
+# ---------- служебные парсеры ----------
+def parse_location_line(text: str) -> tuple[str, list[str]] | None:
+    """Возвращает (комната, [выходы]) или None если формат неверный."""
+    if ':' not in text:
+        return None
+    room, exits_str = text.split(':', 1)
+    exits = [e.strip() for e in exits_str.split(',') if e.strip()]
+    return room.strip(), exits
 
+# ---------- автокомплит ----------
 async def room_autocomplete(interaction: discord.Interaction, current: str):
-    """Возвращает до 25 названий, начинающихся с current."""
     channel = bot.get_channel(ROOMS_SOURCE_CHANNEL_ID)
-    if not channel:
+    if not channel or not isinstance(interaction.channel, discord.TextChannel):
         return []
 
-    names = []
-    async for msg in channel.history(limit=None):
-        if msg.content and msg.content.strip():
-            names.append(msg.content.strip())
+    # определяем текущую комнату по названию канала
+    current_room = interaction.channel.name
+    exits = []
 
-    # уникальные, отсортированные, фильтр
-    matches = [name for name in sorted(set(names))
-               if current.lower() in name.lower()][:25]
-    return [discord.app_commands.Choice(name=name, value=name) for name in matches]
+    async for msg in channel.history(limit=None):
+        parsed = parse_location_line(msg.content)
+        if parsed and parsed[0].lower() == current_room.lower():
+            exits = [e for e in parsed[1] if current.lower() in e.lower()]
+            break
+
+    return [app_commands.Choice(name=e, value=e) for e in exits][:25]
 
 async def log_action(channel: discord.TextChannel | None,
                      author: discord.Member | discord.User,
@@ -54,7 +67,7 @@ async def log_action(channel: discord.TextChannel | None,
     color_map = {"success": 0x1e8e3e, "warn": 0xff7800, "error": 0x990000}
 
     compact = (
-        f"{description} | {author.display_name} | "
+        f"{description} |"
         f"{extra}"
     ).strip()
 
@@ -218,35 +231,101 @@ async def точнаяочистка(ctx: commands.Context, count: int, *, phras
                          f"Не удалось выполнить `точнаяочистка`: {e}",
                          level="error")
 
-@bot.command(name="очиститьдо")
+import re
+from typing import Optional
+
+URL_REGEX = re.compile(
+    r"https?://(?:discord|discordapp)\.com/channels/(?P<guild>\d+)/(?P<channel>\d+)/(?P<message>\d+)"
+)
+
+def parse_msg_link(url: str) -> Optional[tuple[int, int, int]]:
+    """Возвращает (guild_id, channel_id, message_id) или None."""
+    match = URL_REGEX.match(url)
+    if not match:
+        return None
+    return int(match.group("guild")), int(match.group("channel")), int(match.group("message"))
+
+@bot.command(name="очиститьпосле")
 @commands.has_permissions(manage_messages=True)
-async def очиститьдо(ctx: commands.Context, date_str: str):
-    """!очиститьдо ДД.ММ.ГГГГ — удалить все сообщения до указанной даты (включительно)."""
+async def очиститьпосле(ctx: commands.Context, url: str, count: int):
+    """!очиститьпосле <ссылка> <N> – удалить последние N сообщений, заканчивая указанным (включительно)."""
     try:
         if not has_allowed_role(ctx.author):
-            await log_action(ctx.channel, ctx.author,
-                             "Недостаточно прав для использования команды `очиститьдо`.",
-                             level="warn")
+            await log_action(ctx.channel, ctx.author, "Недостаточно прав", level="warn")
             return
-
         await ctx.message.delete()
-        try:
-            until_date = datetime.strptime(date_str, "%d.%m.%Y").replace(tzinfo=timezone.utc)
-        except ValueError:
-            await log_action(ctx.channel, ctx.author,
-                             "Неверный формат даты: используйте ДД.ММ.ГГГГ.",
-                             level="warn")
+
+        parsed = parse_msg_link(url)
+        if not parsed or parsed[0] != ctx.guild.id or parsed[1] != ctx.channel.id:
+            await log_action(ctx.channel, ctx.author, "Ссылка некорректна", level="warn")
             return
 
-        deleted = await ctx.channel.purge(after=until_date, oldest_first=True, bulk=True)
-        await log_action(ctx.channel, ctx.author,
-                         f"Удалено {len(deleted)} сообщений до {date_str}.",
-                         level="success")
-    except Exception as e:
-        await log_action(ctx.channel, ctx.author,
-                         f"Не удалось выполнить `очиститьдо`: {e}",
-                         level="error")
+        target_msg = await ctx.channel.fetch_message(parsed[2])
 
+        # собираем последние N сообщений, заканчивая target_msg
+        msgs_to_delete = []
+        async for msg in ctx.channel.history(limit=None, oldest_first=False):
+            if msg.id == target_msg.id:
+                msgs_to_delete.append(msg)
+                break
+            msgs_to_delete.append(msg)
+            if len(msgs_to_delete) >= count:
+                break
+
+        # если нашли меньше N – берём ровно то количество
+        msgs_to_delete = msgs_to_delete[:count]
+
+        for msg in msgs_to_delete:
+            await msg.delete()
+
+        await log_action(ctx.channel, ctx.author,
+                         f"удалено {len(msgs_to_delete)} (до {target_msg.jump_url})",
+                         level="success")
+    except commands.BadArgument:
+        await log_action(ctx.channel, ctx.author,
+                         "Синтаксис: !очиститьпосле <ссылка> <целое-число>", level="warn")
+    except Exception as e:
+        await log_action(ctx.channel, ctx.author, f"ошибка: {e}", level="error")
+
+# ---------- !очиститьдо ----------
+@bot.command(name="очиститьдо")
+@commands.has_permissions(manage_messages=True)
+async def очиститьдо(ctx: commands.Context, url: str, count: int):
+    """!очиститьдо <ссылка> <N> – удалить ровно N сообщений, начиная с указанного (включительно) и ранее."""
+    try:
+        if not has_allowed_role(ctx.author):
+            await log_action(ctx.channel, ctx.author, "Недостаточно прав", level="warn")
+            return
+        await ctx.message.delete()
+
+        parsed = parse_msg_link(url)
+        if not parsed or parsed[0] != ctx.guild.id or parsed[1] != ctx.channel.id:
+            await log_action(ctx.channel, ctx.author, "Ссылка некорректна", level="warn")
+            return
+
+        target_msg = await ctx.channel.fetch_message(parsed[2])
+        before_dt = target_msg.created_at
+
+        msgs_to_delete = []
+        async for msg in ctx.channel.history(limit=None, before=before_dt, oldest_first=False):
+            if len(msgs_to_delete) >= count - 1:
+                break
+            msgs_to_delete.append(msg)
+        msgs_to_delete.append(target_msg)
+
+        msgs_to_delete = msgs_to_delete[:count]
+
+        for msg in msgs_to_delete:
+            await msg.delete()
+
+        await log_action(ctx.channel, ctx.author,
+                         f"удалено {len(msgs_to_delete)} до {target_msg.jump_url}",
+                         level="success")
+    except commands.BadArgument:
+        await log_action(ctx.channel, ctx.author,
+                         "Синтаксис: !очиститьдо <ссылка> <целое-число>", level="warn")
+    except Exception as e:
+        await log_action(ctx.channel, ctx.author, f"ошибка: {e}", level="error")
 
 # --------------------- HELP ---------------------
 @bot.command(aliases=["помоги", "help"])
@@ -288,69 +367,90 @@ async def help_cmd(ctx: commands.Context):
     except discord.Forbidden:
         await ctx.send("Не получается отправить вам личное сообщение. Возможно, у вас закрыты ЛС.", delete_after=10)
 
-# --------------------- Slash ----------------------
-
+# ---------- slash-команда ----------
 @bot.tree.command(name="move", description="Переместиться в другую комнату")
-@app_commands.describe(room="Название целевой комнаты")
-@app_commands.autocomplete(room=room_autocomplete)
-async def move(interaction: discord.Interaction, room: str):
+@app_commands.describe(exit="Куда вы хотите пойти")
+@app_commands.autocomplete(exit=room_autocomplete)
+async def move(interaction: discord.Interaction, exit: str):
     member = interaction.user
     guild = interaction.guild
     source_channel = interaction.channel
 
-    # ---------- проверки ----------
+    # 1. проверка категории начального канала
     if not isinstance(source_channel, discord.TextChannel) or \
        source_channel.category_id != ALLOWED_CATEGORY_ID:
-        await log_action(source_channel, member,
-                         "/move вне категории", level="warn")
+        await log_action(None, member,
+                         f"{member.display_name} /move вне категории",
+                         extra="", level="warn", send_dm=False)
         return await interaction.response.send_message(
             "Команду можно использовать только в разрешённой категории.", ephemeral=True
         )
 
+    current_room = source_channel.name
+
+    # 2. парсим список выходов из текущей комнаты
     list_ch = bot.get_channel(ROOMS_SOURCE_CHANNEL_ID)
-    valid_rooms = {msg.content.strip() async for msg in list_ch.history(limit=None)
-                   if msg.content and msg.content.strip()}
-    if room not in valid_rooms:
+    allowed_exits = []
+    async for msg in list_ch.history(limit=None):
+        parsed = parse_location_line(msg.content)
+        if parsed and parsed[0].lower() == current_room.lower():
+            allowed_exits = parsed[1]
+            break
+
+    # 3. проверка, что целевая комната есть в списке выходов
+    if exit not in allowed_exits:
         await log_action(source_channel, member,
-                         f"нет локации: {room}", level="warn")
+                         f"{member.display_name} выхода нет: {exit}",
+                         extra="", level="warn", send_dm=False)
         return await interaction.response.send_message(
-            f"Локация **{room}** отсутствует в списке.", ephemeral=True
+            f"Из **{current_room}** нет выхода в **{exit}**.", ephemeral=True
         )
 
+    # 4. проверка существования целевого канала
     target_channel = discord.utils.get(guild.text_channels,
-                                       name=room,
+                                       name=exit,
                                        category_id=ALLOWED_CATEGORY_ID)
     if not target_channel:
         await log_action(source_channel, member,
-                         f"канал вне категории: {room}", level="warn")
+                         f"{member.display_name} канал не найден: {exit}",
+                         extra="", level="warn", send_dm=False)
         return await interaction.response.send_message(
-            f"Канал **{room}** не находится в разрешённой категории.", ephemeral=True
+            f"Канал **{exit}** не существует или вне категории.", ephemeral=True
         )
 
-    # ---------- перемещение ----------
+    # 5. перемещение
     try:
+        # открываем целевой
         await target_channel.set_permissions(member, read_messages=True, send_messages=True)
+
+        # сообщение в целевой канал
+        await target_channel.send(f"*Пришёл {member.mention}*")
+
+        # сообщение в текущий канал
         await interaction.response.send_message(
             f"{member.display_name} ушёл в {target_channel.mention}"
         )
         move_msg = await interaction.original_response()
+
+        # закрываем исходный
         await source_channel.set_permissions(member, read_messages=False, send_messages=False)
 
+        # логируем
         await log_action(
             None,
             member,
-            "перемещён",
-            extra=f"{source_channel.mention} → {target_channel.mention} [ССЫЛКА]({move_msg.jump_url})",
+            f"{member.display_name}",
+            extra=f"{source_channel.mention} → {target_channel.mention} | [**ССЫЛКА**]({move_msg.jump_url})",
             level="success",
             send_dm=False
         )
     except discord.Forbidden:
         await log_action(source_channel, member,
-                         "недостаточно прав", level="error")
+                         f"{member.display_name} недостаточно прав",
+                         extra="", level="error", send_dm=False)
         await interaction.response.send_message(
             "Не удалось изменить права.", ephemeral=True
         )
-
 
 # --------------------- ЗАПУСК ---------------------
 @bot.event
